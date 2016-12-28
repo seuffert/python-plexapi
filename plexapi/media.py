@@ -177,7 +177,16 @@ class MediaTag(object):
         return '<%s:%s:%s>' % (self.__class__.__name__, self.id, tag)
 
 
-class Collection(MediaTag): TYPE = 'Collection'; FILTER = 'collection'
+class Collection(MediaTag):
+    TYPE = 'Collection'
+    FILTER = 'collection'
+
+    def addTag(self, tag):
+        return "addTag"
+
+    def removeTag(selfself, tag):
+        return "removeTag"
+
 class Country(MediaTag): TYPE = 'Country'; FILTER = 'country'
 class Director(MediaTag): TYPE = 'Director'; FILTER = 'director'
 class Genre(MediaTag): TYPE = 'Genre'; FILTER = 'genre'
