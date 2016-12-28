@@ -182,10 +182,10 @@ class Collection(MediaTag):
     FILTER = 'collection'
 
     def addTag(self, tag):
-        return "addTag"
+        return "addTag {}".format(tag)
 
     def removeTag(selfself, tag):
-        return "removeTag"
+        return "removeTag {}".format(tag)
 
 class Country(MediaTag): TYPE = 'Country'; FILTER = 'country'
 class Director(MediaTag): TYPE = 'Director'; FILTER = 'director'
