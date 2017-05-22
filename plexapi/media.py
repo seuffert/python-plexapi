@@ -182,7 +182,7 @@ class Collection(MediaTag):
     FILTER = 'collection'
 
     def addTag(self, tag):
-        return "addTag {}".format(tag)
+        return "addTag {} {}".format(tag, self.key)
 
     def removeTag(selfself, tag):
         return "removeTag {}".format(tag)

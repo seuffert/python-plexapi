@@ -82,7 +82,6 @@ class Video(PlexPartialObject):
         """
         return self.server.library.sectionByID(self.librarySectionID)
 
-
 @utils.register_libtype
 class Movie(Video, Playable):
     TYPE = 'movie'
@@ -146,6 +145,19 @@ class Movie(Video, Playable):
     def isWatched(self):
         return bool(self.viewCount > 0)
 
+    def addCollectionTag(self, tag):
+        args = {}
+        args['id'] = self.ratingKey
+        args['type'] = utils.searchType(self.type)
+        colcount = 0
+        for col in self.collections:
+            if col.tag == tag:
+                return False
+            args['collection[%s].tag.tag' % colcount] = col.tag
+            colcount += 1
+        args['collection[%s].tag.tag' % colcount] = tag
+        path = '/library/sections/%s/all%s' % (self.librarySectionID, utils.joinArgs(args))
+        return self.server.query(path, method=self.server.session.put)
 
 @utils.register_libtype
 class Show(Video):
