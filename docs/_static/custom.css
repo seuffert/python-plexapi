@@ -1,0 +1,9 @@
+@import url("css/theme.css");
+
+.modname {
+    font-size: 0.8em;
+    opacity: 0.4;
+}
+.modname::before {
+    content: '- ';
+}

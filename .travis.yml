@@ -1,0 +1,27 @@
+#---------------------------------------------------------
+# Travis CI Build Environment
+# https://docs.travis-ci.com/user/customizing-the-build
+#---------------------------------------------------------
+language:
+  - python
+
+python:
+  - "2.7"
+  - "3.4"
+  - "3.6"
+
+before_install:
+  - pip install -U pytest pytest-cov coveralls
+
+install:
+  - pip install -r requirements_dev.txt
+
+script:
+  - if [ "$TRAVIS_PULL_REQUEST" = "false" ]; then py.test tests --tb=native --verbose --cov-config .coveragerc --cov=plexapi; fi
+  - flake8 plexapi --exclude=compat.py --max-line-length=120 --ignore=E128,E701,E702,E731,W293
+
+after_success:
+  - coveralls
+
+matrix:
+  fast_finish: true

@@ -1,273 +1,68 @@
 # -*- coding: utf-8 -*-
-"""
-PlexAPI Utils
-
-Attributes:
-    LIBRARY_TYPES (dict): Description
-    NA (TYPE): Description
-    SEARCHTYPES (TYPE): Description
-"""
+import logging
+import os
 import re
+import requests
+import time
+import zipfile
 from datetime import datetime
-from plexapi.compat import quote, urlencode
-from plexapi.exceptions import NotFound, UnknownType, Unsupported
 from threading import Thread
-from plexapi import log
+from plexapi import compat
+from plexapi.exceptions import NotFound
 
 # Search Types - Plex uses these to filter specific media types when searching.
-SEARCHTYPES = {'movie': 1, 'show': 2, 'season': 3,
-               'episode': 4, 'artist': 8, 'album': 9, 'track': 10}
+# Library Types - Populated at runtime
+SEARCHTYPES = {'movie': 1, 'show': 2, 'season': 3, 'episode': 4,
+               'artist': 8, 'album': 9, 'track': 10, 'photo': 14}
+PLEXOBJECTS = {}
 
-LIBRARY_TYPES = {}
+
+class SecretsFilter(logging.Filter):
+    """ Logging filter to hide secrets. """
+    def __init__(self, secrets=None):
+        self.secrets = secrets or set()
+
+    def add_secret(self, secret):
+        if secret is not None:
+            self.secrets.add(secret)
+        return secret
+
+    def filter(self, record):
+        cleanargs = list(record.args)
+        for i in range(len(cleanargs)):
+            if isinstance(cleanargs[i], compat.string_type):
+                for secret in self.secrets:
+                    cleanargs[i] = cleanargs[i].replace(secret, '<hidden>')
+        record.args = tuple(cleanargs)
+        return True
 
 
-def register_libtype(cls):
-    """Registry of library types we may come across when parsing XML.
-    This allows us to define a few helper functions to dynamically convery
-    the XML into objects. See buildItem() below for an example.
+def registerPlexObject(cls):
+    """ Registry of library types we may come across when parsing XML. This allows us to
+        define a few helper functions to dynamically convery the XML into objects. See
+        buildItem() below for an example.
     """
-    LIBRARY_TYPES[cls.TYPE] = cls
+    etype = getattr(cls, 'STREAMTYPE', cls.TYPE)
+    ehash = '%s.%s' % (cls.TAG, etype) if etype else cls.TAG
+    if ehash in PLEXOBJECTS:
+        raise Exception('Ambiguous PlexObject definition %s(tag=%s, type=%s) with %s' %
+            (cls.__name__, cls.TAG, etype, PLEXOBJECTS[ehash].__name__))
+    PLEXOBJECTS[ehash] = cls
     return cls
 
 
-class _NA(object):
-    """This used to be a simple variable equal to '__NA__'.
-    However, there has been need to compare NA against None in some use cases.
-    This object allows the internals of PlexAPI to distinguish between unfetched
-    values and fetched, but non-existent values.
-    (NA == None results to True; NA is None results to False)
-    """
-
-    def __bool__(self):
-        """Summary
-
-        Returns:
-            TYPE: Description
-        """
-        return False
-
-    def __eq__(self, other):
-        """Summary
-
-        Args:
-            other (TYPE): Description
-
-        Returns:
-            TYPE: Description
-        """
-        return isinstance(other, _NA) or other in [None, '__NA__']
-
-    def __nonzero__(self):
-        """Summary
-
-        Returns:
-            TYPE: Description
-        """
-        return False
-
-    def __repr__(self):
-        """Summary
-
-        Returns:
-            TYPE: Description
-        """
-        return '__NA__'
-
-NA = _NA()
-
-
-class PlexPartialObject(object):
-    """Not all objects in the Plex listings return the complete list of elements
-    for the object.This object will allow you to assume each object is complete,
-    and if the specified value you request is None it will fetch the full object
-    automatically and update itself.
-
-    Attributes:
-        initpath (TYPE): Description
-        server (TYPE): Description
-    """
-
-    def __init__(self, data, initpath, server=None):
-        """
-        Args:
-            data (xml.etree.ElementTree.Element): passed from server.query
-            initpath (string): Relative path
-            server (None or Plexserver, optional): PMS class your connected to
-        """
-        self.server = server
-        self.initpath = initpath
-        self._loadData(data)
-
-    def __eq__(self, other):
-        """Summary
-
-        Args:
-            other (TYPE): Description
-
-        Returns:
-            TYPE: Description
-        """
-        return other is not None and self.key == other.key
-
-    def __repr__(self):
-        """Pretty repr."""
-        clsname = self.__class__.__name__
-        key = self.key.replace('/library/metadata/', '') if self.key else 'NA'
-        title = self.title.replace(' ', '.')[0:20].encode('utf8')
-        return '<%s:%s:%s>' % (clsname, key, title)
-
-    def __getattr__(self, attr):
-        """Auto reload self, if the attribute is NA
-
-        Args:
-            attr (string): fx key
-        """
-        if attr == 'key' or self.__dict__.get(attr) or self.isFullObject():
-            return self.__dict__.get(attr, NA)
-        self.reload()
-        return self.__dict__.get(attr, NA)
-
-    def __setattr__(self, attr, value):
-        """Set attribute
-
-        Args:
-            attr (string): fx key
-            value (TYPE): Description
-        """
-        if value != NA or self.isFullObject():
-            self.__dict__[attr] = value
-
-    def _loadData(self, data):
-        """Uses a element to set a attrs.
-
-        Args:
-            data (Element): Used by attrs
-        """
-        raise Exception('Abstract method not implemented.')
-
-    def isFullObject(self):
-        return not self.key or self.key == self.initpath
-
-    def isPartialObject(self):
-        return not self.isFullObject()
-
-    def reload(self):
-        """Reload the data for this object from PlexServer XML."""
-        data = self.server.query(self.key)
-        self.initpath = self.key
-        self._loadData(data[0])
-
-
-class Playable(object):
-    """This is a general place to store functions specific to media that is Playable.
-       Things were getting mixed up a bit when dealing with Shows, Season,
-       Artists, Albums which are all not playable.
-
-    Attributes: # todo
-        player (TYPE): Description
-        playlistItemID (TYPE): Description
-        sessionKey (TYPE): Description
-        transcodeSession (TYPE): Description
-        username (TYPE): Description
-        viewedAt (datetime): Description
-    """
-
-    def _loadData(self, data):
-        """Set the class attributes
-
-        Args:
-            data (xml.etree.ElementTree.Element): usually from server.query
-        """
-        # data for active sessions (/status/sessions)
-        self.sessionKey = cast(int, data.attrib.get('sessionKey', NA))
-        self.username = findUsername(data)
-        self.player = findPlayer(self.server, data)
-        self.transcodeSession = findTranscodeSession(self.server, data)
-        # data for history details (/status/sessions/history/all)
-        self.viewedAt = toDatetime(data.attrib.get('viewedAt', NA))
-        # data for playlist items
-        self.playlistItemID = cast(int, data.attrib.get('playlistItemID', NA))
-
-    def getStreamURL(self, **params):
-        """Make a stream url that can be used by vlc.
-
-        Args:
-            **params (dict): Description
-
-        Returns:
-            string: ''
-
-        Raises:
-            Unsupported: Raises a error is the type is wrong.
-        """
-        if self.TYPE not in ('movie', 'episode', 'track'):
-            raise Unsupported(
-                'Fetching stream URL for %s is unsupported.' % self.TYPE)
-        mvb = params.get('maxVideoBitrate')
-        vr = params.get('videoResolution', '')
-        params = {
-            'path': self.key,
-            'offset': params.get('offset', 0),
-            'copyts': params.get('copyts', 1),
-            'protocol': params.get('protocol'),
-            'mediaIndex': params.get('mediaIndex', 0),
-            'X-Plex-Platform': params.get('platform', 'Chrome'),
-            'maxVideoBitrate': max(mvb, 64) if mvb else None,
-            'videoResolution': vr if re.match('^\d+x\d+$', vr) else None
-        }
-        # remove None values
-        params = {k: v for k, v in params.items() if v is not None}
-        streamtype = 'audio' if self.TYPE in ('track', 'album') else 'video'
-        return self.server.url('/%s/:/transcode/universal/start.m3u8?%s' % (streamtype, urlencode(params)))
-
-    def iterParts(self):
-        """Yield parts."""
-        for item in self.media:
-            for part in item.parts:
-                yield part
-
-    def play(self, client):
-        """Start playback on a client.
-
-        Args:
-            client (PlexClient): The client to start playing on.
-        """
-        client.playMedia(self)
-
-
-def buildItem(server, elem, initpath, bytag=False):
-    """Build classes used by the plexapi.
-
-    Args:
-        server (Plexserver): Your connected to.
-        elem (xml.etree.ElementTree.Element): xml from PMS
-        initpath (string): Relative path
-        bytag (bool, optional): Description # figure out what this do
-
-    Raises:
-        UnknownType: Unknown library type libtype
-
-    """
-    libtype = elem.tag if bytag else elem.attrib.get('type')
-    if libtype == 'photo' and elem.tag == 'Directory':
-        libtype = 'photoalbum'
-    if libtype in LIBRARY_TYPES:
-        cls = LIBRARY_TYPES[libtype]
-        return cls(server, elem, initpath)
-    raise UnknownType('Unknown library type: %s' % libtype)
-
-
 def cast(func, value):
-    """Helper to change to the correct type
+    """ Cast the specified value to the specified type (returned by func). Currently this
+        only support int, float, bool. Should be extended if needed.
 
-    Args:
-        func (function): function to used [int, bool float]
-        value (string, int, float): value to cast
+        Parameters:
+            func (func): Calback function to used cast to type (int, bool, float).
+            value (any): value to be cast and returned.
     """
-    if value not in [None, NA]:
+    if value is not None:
         if func == bool:
             return bool(int(value))
-        elif func in [int, float]:
+        elif func in (int, float):
             try:
                 return func(value)
             except ValueError:
@@ -276,202 +71,46 @@ def cast(func, value):
     return value
 
 
-def findKey(server, key):
-    """Finds and builds a object based on ratingKey.
-
-    Args:
-        server (Plexserver): PMS your connected to
-        key (int): key to look for
-
-    Raises:
-        NotFound: Unable to find key. Key
-    """
-    path = '/library/metadata/{0}'.format(key)
+def getattributeOrNone(obj, self, attr):
+    """ Returns result from __getattribute__ or None if not found. """
     try:
-        # Item seems to be the first sub element
-        elem = server.query(path)[0]
-        return buildItem(server, elem, path)
-    except:
-        raise NotFound('Unable to find key: %s' % key)
-
-
-def findItem(server, path, title):
-    """Finds and builds a object based on title.
-
-    Args:
-        server (Plexserver): Description
-        path (string): Relative path
-        title (string): Fx 16 blocks
-
-    Raises:
-        NotFound: Unable to find item: title
-    """
-    for elem in server.query(path):
-        if elem.attrib.get('title').lower() == title.lower():
-            return buildItem(server, elem, path)
-    raise NotFound('Unable to find item: %s' % title)
-
-
-def findLocations(data, single=False):
-    """Extract the path from a location tag
-
-    Args:
-        data (xml.etree.ElementTree.Element): xml from PMS as Element
-        single (bool, optional): Only return one
-
-    Returns:
-        filepath string if single is True else list of filepaths
-    """
-    locations = []
-    for elem in data:
-        if elem.tag == 'Location':
-            locations.append(elem.attrib.get('path'))
-    if single:
-        return locations[0] if locations else None
-    return locations
-
-
-def findPlayer(server, data):
-    """Find a player in a elementthee
-
-    Args:
-        server (Plexserver): PMS your connected to
-        data (xml.etree.ElementTree.Element): xml from pms as a element
-
-    Returns:
-        PlexClient or None
-    """
-    elem = data.find('Player')
-    if elem is not None:
-        from plexapi.client import PlexClient
-        baseurl = 'http://%s:%s' % (elem.attrib.get('address'),
-                                    elem.attrib.get('port'))
-        return PlexClient(baseurl, server=server, data=elem)
-    return None
-
-
-def findStreams(media, streamtype):
-    """Find streams.
-
-    Args:
-        media (Show, Movie, Episode): A item where find streams
-        streamtype (string): Possible options [movie, show, episode] # is this correct?
-
-    Returns:
-        list: of streams
-    """
-    streams = []
-    for mediaitem in media:
-        for part in mediaitem.parts:
-            for stream in part.streams:
-                if stream.TYPE == streamtype:
-                    streams.append(stream)
-    return streams
-
-
-def findTranscodeSession(server, data):
-    """Find transcode session.
-
-    Args:
-        server (Plexserver): PMS your connected to
-        data (xml.etree.ElementTree.Element): XML response from PMS as Element
-
-    Returns:
-        media.TranscodeSession or None
-    """
-
-    elem = data.find('TranscodeSession')
-    if elem is not None:
-        from plexapi import media
-        return media.TranscodeSession(server, elem)
-    return None
-
-
-def findUsername(data):
-    """Find a username in a Element
-
-    Args:
-        data (xml.etree.ElementTree.Element): XML from PMS as a Element
-
-    Returns:
-        username or None
-    """
-    elem = data.find('User')
-    if elem is not None:
-        return elem.attrib.get('title')
-    return None
-
-
-def isInt(string):
-    """Check of a string is a int"""
-    try:
-        int(string)
-        return True
-    except ValueError:
-        return False
+        return super(obj, self).__getattribute__(attr)
+    except AttributeError:
+        return None
 
 
 def joinArgs(args):
-    """Builds a query string where only
-       the value is quoted.
+    """ Returns a query string (uses for HTTP URLs) where only the value is URL encoded.
+        Example return value: '?genre=action&type=1337'.
 
-    Args:
-        args (dict): ex {'genre': 'action', 'type': 1337}
-
-    Returns:
-        string: ?genre=action&type=1337
+        Parameters:
+            args (dict): Arguments to include in query string.
     """
     if not args:
         return ''
     arglist = []
     for key in sorted(args, key=lambda x: x.lower()):
         value = str(args[key])
-        arglist.append('%s=%s' % (key, quote(value)))
+        arglist.append('%s=%s' % (key, compat.quote(value)))
     return '?%s' % '&'.join(arglist)
 
 
-def listChoices(server, path):
-    """ListChoices is by _cleanSort etc.
+def lowerFirst(s):
+    return s[0].lower() + s[1:]
 
-    Args:
-        server (Plexserver): Server your connected to
-        path (string): Relative path to PMS
 
-    Returns:
-        dict: title:key
+def rget(obj, attrstr, default=None, delim='.'):  # pragma: no cover
+    """ Returns the value at the specified attrstr location within a nexted tree of
+        dicts, lists, tuples, functions, classes, etc. The lookup is done recursivley
+        for each key in attrstr (split by by the delimiter) This function is heavily
+        influenced by the lookups used in Django templates.
+
+        Parameters:
+            obj (any): Object to start the lookup in (dict, obj, list, tuple, etc).
+            attrstr (str): String to lookup (ex: 'foo.bar.baz.value')
+            default (any): Default value to return if not found.
+            delim (str): Delimiter separating keys in attrstr.
     """
-    return {c.attrib['title']: c.attrib['key'] for c in server.query(path)}
-
-
-def listItems(server, path, libtype=None, watched=None, bytag=False):
-    """Return a list buildItem. See buildItem doc.
-
-    Args:
-        server (Plexserver): PMS your connected to.
-        path (string): Relative path to PMS
-        libtype (None or string, optional): [movie, show, episode, music] # check me
-        watched (None, True, False, optional): Skip or include watched items
-        bytag (bool, optional): Dunno wtf this is used for # todo
-
-    Returns:
-        list: of buildItem
-    """
-    items = []
-    for elem in server.query(path):
-        if libtype and elem.attrib.get('type') != libtype:
-            continue
-        if watched is True and elem.attrib.get('viewCount', 0) == 0:
-            continue
-        if watched is False and elem.attrib.get('viewCount', 0) >= 1:
-            continue
-        try:
-            items.append(buildItem(server, elem, path, bytag))
-        except UnknownType:
-            pass
-    return items
-
-
-def rget(obj, attrstr, default=None, delim='.'):
     try:
         parts = attrstr.split(delim, 1)
         attr = parts[0]
@@ -492,19 +131,14 @@ def rget(obj, attrstr, default=None, delim='.'):
 
 
 def searchType(libtype):
-    """Map search type name to int using SEACHTYPES
-       Used when querying PMS.
+    """ Returns the integer value of the library string type.
 
-    Args:
-        libtype (string): Possible options see SEARCHTYPES
+        Parameters:
+            libtype (str): LibType to lookup (movie, show, season, episode, artist, album, track)
 
-    Returns:
-        int: fx 1
-
-    Raises:
-        NotFound: Unknown libtype: libtype
+        Raises:
+            NotFound: Unknown libtype
     """
-
     libtype = str(libtype)
     if libtype in [str(v) for v in SEARCHTYPES.values()]:
         return libtype
@@ -514,18 +148,19 @@ def searchType(libtype):
 
 
 def threaded(callback, listargs):
-    """Run some function in threads.
+    """ Returns the result of <callback> for each set of \*args in listargs. Each call
+        to <callback. is called concurrently in their own separate threads.
 
-    Args:
-        callback (function): funcion to run in thread
-        listargs (list): args parssed to the callback
-
+        Parameters:
+            callback (func): Callback function to apply to each set of \*args.
+            listargs (list): List of lists; \*args to pass each thread.
     """
     threads, results = [], []
     for args in listargs:
         args += [results, len(results)]
         results.append(None)
         threads.append(Thread(target=callback, args=args))
+        threads[-1].setDaemon(True)
         threads[-1].start()
     for thread in threads:
         thread.join()
@@ -533,18 +168,112 @@ def threaded(callback, listargs):
 
 
 def toDatetime(value, format=None):
-    """Helper for datetime
+    """ Returns a datetime object from the specified value.
 
-    Args:
-        value (string): value to use to make datetime
-        format (None, optional): string as strptime.
-
-    Returns:
-        datetime
+        Parameters:
+            value (str): value to return as a datetime
+            format (str): Format to pass strftime (optional; if value is a str).
     """
-    if value and value != NA:
+    if value and value is not None:
         if format:
             value = datetime.strptime(value, format)
         else:
             value = datetime.fromtimestamp(int(value))
     return value
+
+
+def toList(value, itemcast=None, delim=','):
+    """ Returns a list of strings from the specified value.
+
+        Parameters:
+            value (str): comma delimited string to convert to list.
+            itemcast (func): Function to cast each list item to (default str).
+            delim (str): string delimiter (optional; default ',').
+    """
+    value = value or ''
+    itemcast = itemcast or str
+    return [itemcast(item) for item in value.split(delim) if item != '']
+
+
+def downloadSessionImages(server, filename=None, height=150, width=150, opacity=100, saturation=100):
+    """ Helper to download a bif image or thumb.url from plex.server.sessions.
+
+       Parameters:
+           filename (str): default to None,
+           height (int): Height of the image.
+           width (int): width of the image.
+           opacity (int): Opacity of the resulting image (possibly deprecated).
+           saturation (int): Saturating of the resulting image.
+
+       Returns:
+            {'hellowlol': {'filepath': '<filepath>', 'url': 'http://<url>'},
+            {'<username>': {filepath, url}}, ...
+    """
+    info = {}
+    for media in server.sessions():
+        url = None
+        for part in media.iterParts():
+            if media.thumb:
+                url = media.thumb
+            if part.indexes:  # always use bif images if available.
+                url = '/library/parts/%s/indexes/%s/%s' % (part.id, part.indexes.lower(), media.viewOffset)
+        if url:
+            if filename is None:
+                prettyname = media._prettyfilename()
+                filename = 'session_transcode_%s_%s_%s' % (media.usernames[0], prettyname, int(time.time()))
+            url = server.transcodeImage(url, height, width, opacity, saturation)
+            filepath = download(url, filename=filename)
+            info['username'] = {'filepath': filepath, 'url': url}
+    return info
+
+
+def download(url, filename=None, savepath=None, session=None, chunksize=4024, unpack=False, mocked=False):
+    """ Helper to download a thumb, videofile or other media item. Returns the local
+        path to the downloaded file.
+
+       Parameters:
+            url (str): URL where the content be reached.
+            filename (str): Filename of the downloaded file, default None.
+            savepath (str): Defaults to current working dir.
+            chunksize (int): What chunksize read/write at the time.
+            mocked (bool): Helper to do evertything except write the file.
+            unpack (bool): Unpack the zip file
+
+        Example:
+            >>> download(a_episode.getStreamURL(), a_episode.location)
+            /path/to/file
+    """
+    from plexapi import log
+    # fetch the data to be saved
+    session = session or requests.Session()
+    response = session.get(url, stream=True)
+    # make sure the savepath directory exists
+    savepath = savepath or os.getcwd()
+    compat.makedirs(savepath, exist_ok=True)
+    # try getting filename from header if not specified in arguments (used for logs, db)
+    if not filename and response.headers.get('Content-Disposition'):
+        filename = re.findall(r'filename=\"(.+)\"', response.headers.get('Content-Disposition'))
+        filename = filename[0] if filename[0] else None
+    filename = os.path.basename(filename)
+    fullpath = os.path.join(savepath, filename)
+    # append file.ext from content-type if not already there
+    extension = os.path.splitext(fullpath)[-1]
+    if not extension:
+        contenttype = response.headers.get('content-type')
+        if contenttype and 'image' in contenttype:
+            fullpath += contenttype.split('/')[1]
+    # check this is a mocked download (testing)
+    if mocked:
+        log.debug('Mocked download %s', fullpath)
+        return fullpath
+    # save the file to disk
+    log.info('Downloading: %s', fullpath)
+    with open(fullpath, 'wb') as handle:
+        for chunk in response.iter_content(chunk_size=chunksize):
+            handle.write(chunk)
+    # check we want to unzip the contents
+    if fullpath.endswith('zip') and unpack:
+        with zipfile.ZipFile(fullpath, 'r') as handle:
+            handle.extractall(savepath)
+    # finished; return fillpath
+    return fullpath

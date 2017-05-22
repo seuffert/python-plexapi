@@ -1,0 +1,16 @@
+#---------------------------------------------------------
+# PlexAPI requirements to run py.test.
+# pip install -r requirments_dev.txt
+#---------------------------------------------------------
+coveralls
+flake8
+pillow
+pytest
+pytest-cache
+pytest-cov
+recommonmark
+requests
+sphinx
+sphinx-rtd-theme
+sphinxcontrib-napoleon
+websocket-client
